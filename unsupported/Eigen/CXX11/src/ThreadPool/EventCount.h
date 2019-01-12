@@ -53,7 +53,9 @@ class EventCount {
   EventCount(MaxSizeVector<Waiter>& waiters) : waiters_(waiters) {
     eigen_plain_assert(waiters.size() < (1 << kWaiterBits) - 1);
     // Initialize epoch to something close to overflow to test overflow.
-    state_ = kStackMask | (kEpochMask - kEpochInc * waiters.size() * 2);
+    const uint64_t start_epoch = kEpochMask - kEpochInc * waiters.size() * 2;
+    state_ = kStackMask | start_epoch;
+    freeze_state_ = start_epoch - 1;
   }
 
   ~EventCount() {
@@ -65,6 +67,8 @@ class EventCount {
   // After calling this function the thread must re-check the wait predicate
   // and call either CancelWait or CommitWait passing the same Waiter object.
   void Prewait(Waiter* w) {
+    while (state_.load(std::memory_order_relaxed) == freeze_state_)
+      EIGEN_THREAD_YIELD();
     w->epoch = state_.fetch_add(kWaiterInc, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_seq_cst);
   }
@@ -104,6 +108,8 @@ class EventCount {
 
   // CancelWait cancels effects of the previous Prewait call.
   void CancelWait(Waiter* w) {
+    while (state_.load(std::memory_order_relaxed) == freeze_state_)
+      EIGEN_THREAD_YIELD();
     uint64_t epoch =
         (w->epoch & kEpochMask) +
         (((w->epoch & kWaiterMask) >> kWaiterShift) << kEpochShift);
@@ -128,38 +134,76 @@ class EventCount {
 
   // Notify wakes one or all waiting threads.
   // Must be called after changing the associated wait predicate.
-  void Notify(bool notifyAll) {
+  void Notify(bool notifyAll, int prefer_idx = -1) {
+    while (state_.load(std::memory_order_relaxed) == freeze_state_)
+      EIGEN_THREAD_YIELD();
+
     std::atomic_thread_fence(std::memory_order_seq_cst);
+
+    bool want_swap_waiters = false;
+    Waiter* w_prefer = prefer_idx == -1 ? nullptr : &waiters_[prefer_idx];
+    Waiter* w_before = nullptr;
+
     uint64_t state = state_.load(std::memory_order_acquire);
     for (;;) {
       // Easy case: no waiters.
-      if ((state & kStackMask) == kStackMask && (state & kWaiterMask) == 0)
+D      if ((state & kStackMask) == kStackMask && (state & kWaiterMask) == 0)
         return;
-      uint64_t waiters = (state & kWaiterMask) >> kWaiterShift;
-      uint64_t newstate;
+D      uint64_t waiters = (state & kWaiterMask) >> kWaiterShift;
+      uint64_t newstate, newstate_after_freeze;
       if (notifyAll) {
         // Reset prewait counter and empty wait list.
         newstate = (state & kEpochMask) + (kEpochInc * waiters) + kStackMask;
       } else if (waiters) {
         // There is a thread in pre-wait state, unblock it.
         newstate = state + kEpochInc - kWaiterInc;
-      } else {
+D      } else {
         // Pop a waiter from list and unpark it.
         Waiter* w = &waiters_[state & kStackMask];
-        Waiter* wnext = w->next.load(std::memory_order_relaxed);
-        uint64_t next = kStackMask;
-        if (wnext != nullptr) next = wnext - &waiters_[0];
-        // Note: we don't add kEpochInc here. ABA problem on the lock-free stack
-        // can't happen because a waiter is re-pushed onto the stack only after
-        // it was in the pre-wait state which inevitably leads to epoch
-        // increment.
-        newstate = (state & kEpochMask) + next;
+
+        // Try find preferable waiter in waiter list
+        if (w_prefer && w != w_prefer) {
+          if (_DEBUG) printf("try making affinity\n");
+          Waiter *wthis = w;
+          for (;;) {
+            Waiter* wnext = wthis->next.load(std::memory_order_relaxed);
+            if (wnext == nullptr) break;
+            if (wnext == w_prefer) {
+              w_before = wthis;
+              want_swap_waiters = true;
+              newstate = freeze_state_;
+              newstate_after_freeze = state;
+              break;
+            }
+            wthis = wnext;
+          }
+        }
+
+        if (!want_swap_waiters) {
+          Waiter* wnext = w->next.load(std::memory_order_relaxed);
+          uint64_t next = kStackMask;
+          if (wnext != nullptr) next = wnext - &waiters_[0];
+          // Note: we don't add kEpochInc here. ABA problem on the lock-free
+          // stack can't happen because a waiter is re-pushed onto the stack
+          // only after it was in the pre-wait state which inevitably leads
+          // to epoch increment.
+          newstate = (state & kEpochMask) + next;
+        }
       }
       if (state_.compare_exchange_weak(state, newstate,
                                        std::memory_order_acquire)) {
         if (!notifyAll && waiters) return;  // unblocked pre-wait thread
         if ((state & kStackMask) == kStackMask) return;
         Waiter* w = &waiters_[state & kStackMask];
+        if (want_swap_waiters) {
+          eigen_plain_assert(w_before != nullptr);
+          w_before->next.store(w_prefer->next.load(std::memory_order_relaxed));
+          w = w_prefer;
+          if (!state_.compare_exchange_weak(newstate, newstate_after_freeze,
+                                            std::memory_order_acquire)) {
+            eigen_plain_assert(!"unexpected invention!");
+          }
+        }
         if (!notifyAll) w->next.store(nullptr, std::memory_order_relaxed);
         Unpark(w);
         return;
@@ -200,6 +244,8 @@ class EventCount {
   static const uint64_t kEpochMask = ((1ull << kEpochBits) - 1) << kEpochShift;
   static const uint64_t kEpochInc = 1ull << kEpochShift;
   std::atomic<uint64_t> state_;
+  // state at which Prewait, CommitWait, and Notify should retry
+  uint64_t freeze_state_;
   MaxSizeVector<Waiter>& waiters_;
 
   void Park(Waiter* w) {

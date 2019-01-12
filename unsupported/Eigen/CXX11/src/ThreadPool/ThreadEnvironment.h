@@ -15,6 +15,7 @@ namespace Eigen {
 struct StlThreadEnvironment {
   struct Task {
     std::function<void()> f;
+    int pref_tid;
   };
 
   // EnvThread constructor must start the thread,
@@ -31,7 +32,7 @@ struct StlThreadEnvironment {
   };
 
   EnvThread* CreateThread(std::function<void()> f) { return new EnvThread(std::move(f)); }
-  Task CreateTask(std::function<void()> f) { return Task{std::move(f)}; }
+  Task CreateTask(std::function<void()> f, int pref_tid = -1) { return Task{std::move(f), pref_tid}; }
   void ExecuteTask(const Task& t) { t.f(); }
 };
 

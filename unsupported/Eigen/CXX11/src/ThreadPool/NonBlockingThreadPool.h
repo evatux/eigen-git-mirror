@@ -103,7 +103,7 @@ class ThreadPoolTempl : public Eigen::ThreadPoolInterface {
 
   void ScheduleWithHint(std::function<void()> fn, int start,
                         int limit) override {
-    Task t = env_.CreateTask(std::move(fn));
+    Task t = env_.CreateTask(std::move(fn), limit - start == 1 ? start : -1);
     PerThread* pt = GetPerThread();
     if (pt->pool == this) {
       // Worker thread of this pool, push onto the thread's queue.
@@ -118,7 +118,10 @@ class ThreadPoolTempl : public Eigen::ThreadPoolInterface {
       int rnd = Rand(&pt->rand) % num_queues;
       eigen_plain_assert(start + rnd < limit);
       Queue& q = thread_data_[start + rnd].queue;
-      t = q.PushBack(std::move(t));
+      if (num_queues == 1)
+        t = q.PushFront(std::move(t));
+      else
+        t = q.PushBack(std::move(t));
     }
     // Note: below we touch this after making w available to worker threads.
     // Strictly speaking, this can lead to a racy-use-after-free. Consider that
@@ -128,7 +131,10 @@ class ThreadPoolTempl : public Eigen::ThreadPoolInterface {
     // this. We expect that such scenario is prevented by program, that is,
     // this is kept alive while any threads can potentially be in Schedule.
     if (!t.f) {
-      ec_.Notify(false);
+      if (limit - start == 1)
+        ec_.Notify(false, start);
+      else
+        ec_.Notify(false);
     } else {
       env_.ExecuteTask(t);  // Push failed, execute directly.
     }
@@ -293,7 +299,8 @@ class ThreadPoolTempl : public Eigen::ThreadPoolInterface {
           env_.ExecuteTask(t);
         }
       }
-    } else {
+    } else
+    {
       while (!cancelled_) {
         Task t = q.PopFront();
         if (!t.f) {
@@ -371,6 +378,7 @@ class ThreadPoolTempl : public Eigen::ThreadPoolInterface {
   // time to exit (returns false). Can optionally return a task to execute in t
   // (in such case t.f != nullptr on return).
   bool WaitForWork(EventCount::Waiter* waiter, Task* t) {
+const int thread_id = waiter - &waiters_[0];
     eigen_plain_assert(!t->f);
     // We already did best-effort emptiness check in Steal, so prepare for
     // blocking.
@@ -383,7 +391,9 @@ class ThreadPoolTempl : public Eigen::ThreadPoolInterface {
         return false;
       } else {
         *t = thread_data_[victim].queue.PopBack();
-        return true;
+        if (t->pref_tid == -1 || t->pref_tid == thread_id)
+          return true;
+        thread_data_[victim].queue.PushBack(std::move(*t));
       }
     }
     // Number of blocked threads is used as termination condition.
@@ -412,7 +422,7 @@ class ThreadPoolTempl : public Eigen::ThreadPoolInterface {
       ec_.Notify(true);
       return false;
     }
-    ec_.CommitWait(waiter);
+Z    ec_.CommitWait(waiter);
     blocked_--;
     return true;
   }

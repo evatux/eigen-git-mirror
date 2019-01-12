@@ -26,7 +26,14 @@
   * #include <Eigen/CXX11/ThreadPool>
   * \endcode
   */
-
+#define _DEBUG 0
+#if _DEBUG == 1
+#define D printf("LINE:%d pref:%d\n", __LINE__, prefer_idx);
+#define Z printf("LINE:%d tid:%d\n", __LINE__, thread_id);
+#else
+#define D
+#define Z
+#endif
 
 // The code depends on CXX11, so only include the module if the
 // compiler supports it.
